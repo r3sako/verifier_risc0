@@ -1,0 +1,3 @@
+#!/bin/sh
+# Обёртка cvc5: общий таймаут 60 секунд, CaDiCaL для QF_BV bit-blasting.
+exec cvc5 --tlimit=60000 --bv-sat-solver=cadical "$@" 2>/dev/null

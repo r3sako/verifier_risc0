@@ -1,0 +1,8 @@
+[package]
+name = "zkvm-verifier"
+version = "0.1.0"
+edition = "2021"
+description = "SMT-based verifier for zkVM RISC Zero instructions"
+
+[dependencies]
+smtlib = "0.3"

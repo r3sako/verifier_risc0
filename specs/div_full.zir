@@ -1,0 +1,104 @@
+// Реальный DoDiv из RISC Zero `inst_div.zir`. Тело — буквальная копия из
+// `zirgen/circuit/rv32im/v2/dsl/inst_div.zir` (без обёрток OpDIV/...
+// и без зависимостей от inst.zir/decode.zir/mem.zir).
+//
+// Дополнения для верификации (помечены VERIFIER:):
+//  - signed = 0, ones_comp = 0: фиксируем unsigned-режим (OpDIVU/OpREMU).
+//    Полная signed-семантика требует более сложной спеки умножения; здесь
+//    верифицируем только беззнаковый срез — это уже самая суть деления.
+//  - Явная спека MultiplyAccumulate: outLow + 2^32 * outHigh = quot*denom + rem.
+//    Без неё UF-абстракция MultiplyAccumulate теряет семантику умножения,
+//    а инлайн body даёт неподъёмное число constraint'ов.
+
+import u32;
+import mult;
+
+extern Divide(numer: ValU32, denom: ValU32, sign_type: Val) : DivideReturn;
+
+component DivideReturn(quot: ValU32, rem: ValU32) {
+  public quot := quot;
+  public rem := rem;
+}
+
+#[picus_analyze]
+component DoDiv(numer: ValU32, denom: ValU32, signed: Val, ones_comp: Val) {
+  // VERIFIER: фиксируем unsigned-режим.
+  signed = 0;
+  ones_comp = 0;
+
+  // Guess the answer
+  guess := Divide(numer, denom, signed + 2 * ones_comp);
+  quot_low := NondetReg(guess.quot.low);
+  quot_high:= NondetReg(guess.quot.high);
+  quot := ValU32(quot_low, quot_high);
+  rem_low := NondetU16Reg(guess.rem.low);
+  rem_high:= NondetU16Reg(guess.rem.high);
+  rem := ValU32(rem_low, rem_high);
+  // Either all signed, or nothing signed
+  settings := MultiplySettings(signed, signed, signed);
+  // Do the accumulate
+  mul := MultiplyAccumulate(quot, denom, rem, settings);
+
+  // VERIFIER: явная спека MultiplyAccumulate (unsigned-вариант).
+  //   outLow + 2^32 · outHigh  =  quot · denom + rem  (как 64-битные числа).
+  // Используем U32Reg, чтобы flat-значения были СВЕЖИМИ Int-переменными,
+  // а не суммами (low + 65536·high). Это даёт cvc5 единственный
+  // нелинейный продукт quot_flat · denom_flat, решаемый NIA-движком быстро.
+  numer_flat    := U32Reg(numer.low + 0x10000 * numer.high);
+  denom_flat    := U32Reg(denom.low + 0x10000 * denom.high);
+  quot_flat     := U32Reg(quot.low  + 0x10000 * quot.high);
+  rem_flat      := U32Reg(rem.low   + 0x10000 * rem.high);
+  mul_low_flat  := U32Reg(mul.outLow.low  + 0x10000 * mul.outLow.high);
+  mul_high_flat := U32Reg(mul.outHigh.low + 0x10000 * mul.outHigh.high);
+  mul_low_flat + 0x100000000 * mul_high_flat
+    = quot_flat * denom_flat + rem_flat;
+
+  // Check the main result (numer = quot * denom + rem)
+  AssertEqU32(mul.outLow, numer);
+  // The top bits should all be 0 or all be 1
+  topBitType := NondetBitReg(1 - Isz(mul.outHigh.low));
+  AssertEqU32(mul.outHigh, ValU32(0xffff * topBitType, 0xffff * topBitType));
+  // Get top bit of numerator
+  topNum := NondetBitReg((numer.high & 0x8000) / 0x8000);
+  // Verify we got it right
+  U16Reg((numer.high - 0x8000 * topNum) * 2);
+  numNeg := topNum * signed;
+  // Get the absolute value of the denominator
+  denomNeg := mul.bNeg;
+  denomAbs := NormalizeU32(DenormedValU32(
+    denomNeg * (0x10000 - denom.low) + (1 - denomNeg) * denom.low,
+    denomNeg * (0xffff - denom.high) + (1 - denomNeg) * denom.high
+  ));
+  // Flip the sign of the remainder if the numerator is negative
+  remNormal := NormalizeU32(DenormedValU32(
+    numNeg * (0x10000 - rem.low) + (1 - numNeg) * rem.low,
+    numNeg * (0xffff - rem.high) + (1 - numNeg) * rem.high
+  ));
+  // Three-case dispatch via major mux:
+  //  1) Denom = 0      : quot = 0xffffffff, rem = numer
+  //  2) Signed overflow: numer = INT_MIN, denom = -1 → quot = INT_MIN, rem = 0
+  //  3) Все остальные  : topBitType = numNeg, lt.is_less_than = 1
+  isZero := NondetBitReg(Isz(denom.low + denom.high));
+  signedOverflowCase := NondetBitReg(
+    signed *
+    Isz(numer.low - 0) * Isz(numer.high - 0x8000) *
+    Isz(denom.low - 0xffff) * Isz(denom.high - 0xffff)
+  );
+  lt := CmpLessThanUnsigned(remNormal, denomAbs);
+  [isZero, signedOverflowCase, 1 - isZero - signedOverflowCase] -> (
+  {
+    AssertEqU32(denom, ValU32(0, 0));
+    AssertEqU32(rem, numer);
+    AssertEqU32(quot, ValU32(0xffff, 0xffff));
+  }, {
+    signed = 1;
+    AssertEqU32(numer, ValU32(0, 0x8000));
+    AssertEqU32(denom, ValU32(0xffff, 0xffff));
+    AssertEqU32(quot, ValU32(0, 0x8000));
+    AssertEqU32(rem, ValU32(0, 0));
+  }, {
+    topBitType = numNeg;
+    lt.is_less_than = 1;
+  });
+  DivideReturn(quot, rem)
+}

@@ -1,0 +1,128 @@
+import bits;
+import is_zero;
+import lookups;
+import po2;
+
+component ValU32(low: Val, high: Val) {
+  public low := low;
+  public high := high;
+}
+
+component ConstU32<x:Val>() { ValU32(x & 0xffff, (x - (x & 0xffff)) / 0x10000) }
+
+component DenormedValU32(low: Val, high: Val) {
+  public low := low;
+  public high := high;
+}
+
+component AddU32(a: ValU32, b: ValU32) {
+  DenormedValU32(a.low + b.low, a.high + b.high)
+}
+
+component SubU32(a: ValU32, b: ValU32) {
+  DenormedValU32(0x10000 + a.low - b.low, 0xffff + a.high - b.high)
+}
+
+component Denorm(a: ValU32) {
+  DenormedValU32(a.low, a.high)
+}
+
+component NormalizeU32(x: DenormedValU32) {
+  low16 := NondetU16Reg(x.low & 0xffff);
+  lowCarry := NondetBitReg((x.low & 0x10000) / 0x10000);
+  x.low = lowCarry * 0x10000 + low16;
+  high := x.high + lowCarry;
+  high16 := NondetU16Reg(high & 0xffff);
+  highCarry := NondetBitReg((high & 0x10000) / 0x10000);
+  high = highCarry * 0x10000 + high16;
+  public carry := highCarry;
+  ValU32(low16, high16)
+}
+
+component AddrDecompose(x: ValU32, mode: Val) {
+  public low2 := NondetTwitReg(x.low & 0x3);
+  upperDiff := U16Reg(mode * 0xffff + (1 - mode) * 0xbfff - x.high);
+  IsZero(x.high) = 0;
+  med14 := NondetU16Reg((x.low - low2) / 4);
+  med14 * 4 + low2 = x.low;
+  addr := 0x4000 * x.high + med14;
+  addr
+}
+
+component AddrDecomposeBits(x: ValU32, mode: Val) {
+  public low0 := NondetBitReg(x.low & 0x1);
+  public low1 := NondetBitReg((x.low & 0x2) / 2);
+  public low2 := low1 * 2 + low0;
+  upperDiff := U16Reg(mode * 0xffff + (1 - mode) * 0xbfff - x.high);
+  IsZero(x.high) = 0;
+  med14 := NondetU16Reg((x.low - low2) / 4);
+  med14 * 4 + low2 = x.low;
+  public addr := 0x4000 * x.high + med14;
+  addr
+}
+
+component CondDenormed(cond: Val, a: DenormedValU32, b: DenormedValU32) {
+  DenormedValU32(
+    cond * a.low + (1 - cond) * b.low,
+    cond * a.high + (1 - cond) * b.high)
+}
+
+component AssertEqU32(x: ValU32, y: ValU32) {
+  x.low = y.low;
+  x.high = y.high;
+}
+
+component CmpEqual(x: ValU32, y: ValU32) {
+  low_same := IsZero(x.low - y.low);
+  high_same := IsZero(x.high - y.high);
+  public is_equal := Reg(low_same * high_same);
+}
+
+component CmpLessThanUnsigned(x: ValU32, y: ValU32) {
+  diff := NormalizeU32(SubU32(x, y));
+  public is_less_than := 1 - diff.carry;
+}
+
+component GetSignU32(x: ValU32) {
+  sign := NondetBitReg((x.high & 0x8000) / 0x8000);
+  rest_times_two := NondetU16Reg((x.high & 0x7fff) * 2);
+  x.high = 0x8000 * sign + rest_times_two / 2;
+  sign
+}
+
+component CmpLessThan(x: ValU32, y: ValU32) {
+  diff := NormalizeU32(SubU32(x, y));
+  s1 := GetSignU32(x);
+  s2 := GetSignU32(y);
+  s3 := GetSignU32(diff);
+  overflow := Reg(s1 * (1 - s2) * (1 - s3) + (1 - s1) * s2 * s3);
+  public is_less_than := Reg(overflow + s3 - 2 * overflow * s3);
+}
+
+component BitwiseAndU16(x: Val, y: Val) {
+  bits_x := ToBits<16>(x);
+  x = FromBits<16>(bits_x);
+  bits_y := ToBits<16>(y);
+  y = FromBits<16>(bits_y);
+  bits_r := for i : 0..16 { bits_x[i] * bits_y[i] };
+  r := FromBits<16>(bits_r);
+  r
+}
+
+component BitwiseAnd(x: ValU32, y: ValU32) {
+  ValU32(BitwiseAndU16(x.low, y.low), BitwiseAndU16(x.high, y.high))
+}
+
+component BitwiseOr(x: ValU32, y: ValU32) {
+  and_xy := BitwiseAnd(x, y);
+  ValU32(x.low + y.low - and_xy.low, x.high + y.high - and_xy.high)
+}
+
+component BitwiseXor(x: ValU32, y: ValU32) {
+  and_xy := BitwiseAnd(x, y);
+  ValU32(x.low + y.low - 2*and_xy.low, x.high + y.high - 2*and_xy.high)
+}
+
+component Flat(x: ValU32) {
+  x.low + 0x10000 * x.high
+}

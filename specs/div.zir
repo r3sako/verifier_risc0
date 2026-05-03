@@ -1,0 +1,48 @@
+// Беззнаковое деление, верифицируемое через прямую формулировку.
+//
+// Спека: prover guesses (quot, rem) такие что
+//    numer = quot * denom + rem
+//    rem < denom (через slack: denom = rem + 1 + slack, slack ≥ 0).
+// Уникальность (quot, rem) при denom > 0 — теорема о делении.
+//
+// Ключ: переменные numer, denom, quot, rem, slack — каждая ОДНА Int-переменная
+// в диапазоне [0, 2^32-1] (тип U32), а не пара лимбов. Это даёт ОДНО
+// нелинейное произведение `quot * denom` в формуле, которое cvc5 NIA
+// решает символически за десятки миллисекунд. При лимбной декомпозиции
+// (как в zkVM-представлении ValU32) произведение разворачивается на 4 пары
+// U16×U16, и QF_NIA не справляется в разумное время.
+//
+// Это и есть основной урок: для нелинейных constraint'ов критична форма
+// представления чисел в SMT-модели — она может отличаться от внутреннего
+// представления в zkVM при сохранении эквивалентности.
+
+#[picus_analyze]
+component DoDivU(numer: U32, denom: U32) {
+  // Prover-предоставленные quot и rem, единые U32-переменные.
+  quot := NondetU32Reg(numer);
+  rem  := NondetU32Reg(numer);
+
+  // Главное тождество: numer = quot * denom + rem.
+  numer = quot * denom + rem;
+
+  // rem < denom: через slack. denom = rem + 1 + slack, slack ∈ U32.
+  // Если denom = 0, то rem + 1 + slack ≥ 1, а denom = 0 — constraint
+  // невыполним, что отсекает деление на ноль (как и должно быть).
+  slack := NondetU32Reg(0);
+  denom = rem + 1 + slack;
+
+  public quot := quot;
+  public rem  := rem;
+}
+
+// 16-битная версия для сравнения — та же логика на U16.
+#[picus_analyze]
+component DoDivU16(numer: Val, denom: Val) {
+  quot := NondetU16Reg(0);
+  rem  := NondetU16Reg(0);
+  numer = quot * denom + rem;
+  slack := NondetU16Reg(0);
+  denom = rem + 1 + slack;
+  public quot := quot;
+  public rem  := rem;
+}
