@@ -1,6 +1,4 @@
-// Реальный DoDiv из RISC Zero `inst_div.zir`. Тело — буквальная копия из
-// `zirgen/circuit/rv32im/v2/dsl/inst_div.zir` (без обёрток OpDIV/...
-// и без зависимостей от inst.zir/decode.zir/mem.zir).
+// Реальный DoDiv из RISC Zero `inst_div.zir`.
 //
 // Дополнения для верификации (помечены VERIFIER:):
 //  - signed = 0, ones_comp = 0: фиксируем unsigned-режим (OpDIVU/OpREMU).
