@@ -2,6 +2,8 @@ mod parser;
 mod ir;
 mod verifier;
 mod verifier_int;
+mod verifier_ff;
+mod verifier_msolve;
 
 use parser::Parser;
 use parser::ast::Item;
@@ -14,17 +16,29 @@ fn main() {
     match cmd {
         "parse" => cmd_parse(args.get(2).map(|s| s.as_str()).unwrap_or("specs/u32.zir")),
         "list"  => cmd_list(args.get(2).map(|s| s.as_str()).unwrap_or("specs/u32.zir")),
-        "ir"    => cmd_ir(
-            args.get(2).map(|s| s.as_str()).unwrap_or("specs/u32.zir"),
-            args.get(3).map(|s| s.as_str()).unwrap_or("AddU32"),
-        ),
+        "ir"    => {
+            let (file, instr, abs) = parse_verify_args(&args, "specs/u32.zir");
+            if abs.is_empty() {
+                cmd_ir(file, instr);
+            } else {
+                cmd_ir_with_abstract(file, instr, abs);
+            }
+        }
         "verify" => {
             let (file, instr, abs) = parse_verify_args(&args, "specs/u32.zir");
-            cmd_verify(file, instr, false, abs);
+            cmd_verify(&args, file, instr, "bv", abs);
         }
         "verify-int" => {
             let (file, instr, abs) = parse_verify_args(&args, "specs/mult.zir");
-            cmd_verify(file, instr, true, abs);
+            cmd_verify(&args, file, instr, "int", abs);
+        }
+        "verify-ff" => {
+            let (file, instr, abs) = parse_verify_args(&args, "specs/div_full.zir");
+            cmd_verify(&args, file, instr, "ff", abs);
+        }
+        "verify-msolve" => {
+            let (file, instr, abs) = parse_verify_args(&args, "specs/u32.zir");
+            cmd_verify(&args, file, instr, "msolve", abs);
         }
         _ => {
             println!("zkvm-verifier — автоматический верификатор инструкций RISC Zero\n");
@@ -34,26 +48,31 @@ fn main() {
             println!("  zkvm-verifier ir <file.zir> <instruction>   — показать IR");
             println!("  zkvm-verifier verify <file.zir> <instr>     — верификация (BV<32>)");
             println!("  zkvm-verifier verify-int <file.zir> <instr> — верификация (Int/QF_NIA)");
+            println!("  zkvm-verifier verify-ff <file.zir> <instr>  — верификация (FF/cvc5+CoCoA)");
+            println!("  zkvm-verifier verify-msolve <file.zir> <i>  — верификация (FF/msolve F4)");
             println!();
-            println!("Опционально (только для verify-int):");
-            println!("  --abstract=COMP1,COMP2  — заменить инлайн этих компонентов на UF-абстракцию.");
-            println!("                            Подходит для модульной верификации композитов:");
-            println!("                            компоненты, доказанные независимо, становятся");
-            println!("                            uninterpreted functions — same args → same outputs.");
+            println!("Опции:");
+            println!("  --abstract=COMP1,COMP2  — UF-абстракция компонентов (verify-int, verify-ff)");
+            println!("  --cvc5=PATH             — путь к cvc5 с поддержкой --cocoa (verify-ff)");
+            println!("  --msolve=PATH           — путь к msolve (verify-msolve)");
             println!();
-            println!("Пример: verify-int specs/mult.zir MultiplyAccumulate --abstract=ExpandU32,SplitTotal");
+            println!("Примеры:");
+            println!("  verify-int specs/mult.zir MultiplyAccumulate --abstract=ExpandU32,SplitTotal");
+            println!("  verify-ff specs/div_full.zir DoDiv");
         }
     }
 }
 
-/// Парсит args после команды `verify` / `verify-int`.
-/// Поддерживает `--abstract=COMP1,COMP2,...` флаг и позиционные file/instr.
+/// Парсит args после команды `verify` / `verify-int` / `verify-ff`.
+/// Поддерживает `--abstract=COMP1,COMP2,...` и `--cvc5=PATH` флаги.
 fn parse_verify_args<'a>(args: &'a [String], default_file: &'a str) -> (&'a str, &'a str, Vec<String>) {
     let mut abs: Vec<String> = Vec::new();
     let mut positional: Vec<&str> = Vec::new();
     for a in &args[2..] {
         if let Some(rest) = a.strip_prefix("--abstract=") {
             abs = rest.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
+        } else if a.starts_with("--cvc5=") {
+            // handled in cmd_verify
         } else if !a.starts_with("--") {
             positional.push(a.as_str());
         }
@@ -61,6 +80,24 @@ fn parse_verify_args<'a>(args: &'a [String], default_file: &'a str) -> (&'a str,
     let file = positional.first().copied().unwrap_or(default_file);
     let instr = positional.get(1).copied().unwrap_or("all");
     (file, instr, abs)
+}
+
+fn get_cvc5_path(args: &[String]) -> String {
+    for a in args {
+        if let Some(rest) = a.strip_prefix("--cvc5=") {
+            return rest.to_string();
+        }
+    }
+    "./scripts/cvc5-ff".to_string()
+}
+
+fn get_msolve_path(args: &[String]) -> String {
+    for a in args {
+        if let Some(rest) = a.strip_prefix("--msolve=") {
+            return rest.to_string();
+        }
+    }
+    "msolve".to_string()
 }
 
 fn load(path: &str) -> Vec<Item> {
@@ -122,9 +159,23 @@ fn cmd_list(file: &str) {
     for name in db.names() { println!("  - {}", name); }
 }
 
+fn cmd_ir_with_abstract(file: &str, instr: &str, abstract_list: Vec<String>) {
+    let items = load(file);
+    let mut db = ComponentDB::new(&items);
+    if !abstract_list.is_empty() {
+        let refs: Vec<&str> = abstract_list.iter().map(String::as_str).collect();
+        db.set_abstract(&refs);
+    }
+    cmd_ir_inner(&db, instr);
+}
+
 fn cmd_ir(file: &str, instr: &str) {
     let items = load(file);
     let db = ComponentDB::new(&items);
+    cmd_ir_inner(&db, instr);
+}
+
+fn cmd_ir_inner(db: &ComponentDB, instr: &str) {
     match db.lower(instr) {
         Ok(spec) => {
             println!("=== IR: {} (строка {}) ===\n", spec.name, spec.source_line);
@@ -162,7 +213,7 @@ fn cmd_ir(file: &str, instr: &str) {
     }
 }
 
-fn cmd_verify(file: &str, instr: &str, use_int: bool, abstract_list: Vec<String>) {
+fn cmd_verify(args: &[String], file: &str, instr: &str, mode: &str, abstract_list: Vec<String>) {
     let items = load(file);
     let mut db = ComponentDB::new(&items);
     if !abstract_list.is_empty() {
@@ -179,6 +230,8 @@ fn cmd_verify(file: &str, instr: &str, use_int: bool, abstract_list: Vec<String>
             ].into_iter().map(String::from).collect()
         } else if file.ends_with("div.zir") {
             vec!["DoDivU16", "DoDivU"].into_iter().map(String::from).collect()
+        } else if file.ends_with("div_full.zir") {
+            vec!["DoDiv"].into_iter().map(String::from).collect()
         } else {
             vec![
                 "AddU32","SubU32","NormalizeU32",
@@ -193,11 +246,19 @@ fn cmd_verify(file: &str, instr: &str, use_int: bool, abstract_list: Vec<String>
     println!("\n=== zkVM RISC Zero — Верификатор инструкций ===");
     println!("  Источник: {}", file);
     println!("  Метод: dual-instance determinism check");
-    println!("  Теория: {}", if use_int { "QF_NIA (Int)" } else { "QF_BV (BitVec<32>)" });
+    let theory_name = match mode {
+        "bv" => "QF_BV (BitVec<32>)",
+        "int" => "QF_NIA (Int)",
+        "ff" => &format!("QF_FF (FiniteField p={})", 2013265921u64),
+        "msolve" => &format!("FF/Gröbner (F4, p={})", 2013265921u64),
+        _ => "unknown",
+    };
+    println!("  Теория: {}", theory_name);
     if !abstract_list.is_empty() {
         println!("  UF-абстракция: {}", abstract_list.join(", "));
     }
-    println!("  Решатель: cvc5\n");
+    let solver_name = if mode == "msolve" { "msolve" } else { "cvc5" };
+    println!("  Решатель: {}\n", solver_name);
     println!("  {:<28} {:<6} {:<6} {:<28} {}", "Инструкция", "Пер.", "Огр.", "Результат", "Время");
     println!("  {}", "-".repeat(80));
 
@@ -210,10 +271,17 @@ fn cmd_verify(file: &str, instr: &str, use_int: bool, abstract_list: Vec<String>
     for target in &targets {
         match db.lower(target) {
             Ok(spec) => {
-                let r = if use_int {
-                    verifier_int::verify_determinism(&spec)
-                } else {
-                    verifier::verify_determinism(&spec)
+                let r = match mode {
+                    "int" => verifier_int::verify_determinism(&spec),
+                    "ff" => {
+                        let cvc5 = get_cvc5_path(&args);
+                        verifier_ff::verify_determinism(&spec, &cvc5)
+                    }
+                    "msolve" => {
+                        let msolve = get_msolve_path(&args);
+                        verifier_msolve::verify_determinism(&spec, &msolve)
+                    }
+                    _ => verifier::verify_determinism(&spec),
                 };
                 total += 1;
                 let status = match r.deterministic {

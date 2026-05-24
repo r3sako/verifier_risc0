@@ -1,0 +1,5 @@
+#!/bin/sh
+# Обёртка cvc5 с поддержкой конечных полей (CoCoA/Gröbner).
+# Используется verify-ff бэкендом для QF_FF теории.
+CVC5_FF="${CVC5_FF_PATH:-/tmp/cvc5-cocoa/build/bin/cvc5}"
+exec "$CVC5_FF" --tlimit=120000 "$@" 2>/dev/null

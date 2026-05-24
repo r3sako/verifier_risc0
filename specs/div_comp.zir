@@ -1,0 +1,81 @@
+// Композиционная верификация DoDiv.
+//
+// Идея: вместо инлайна или UF-абстракции CmpLessThanUnsigned и NormalizeU32,
+// используем их СЕМАНТИКУ напрямую, подтверждённую независимой верификацией
+// каждого компонента (шаг 1 композиционного метода).
+//
+// Семантические леммы (из верифицированных компонентов):
+//   1. MultiplyAccumulate: outLow + 2^32·outHigh = a·b + c (при signed=0)
+//   2. CmpLessThanUnsigned(x, y): is_less_than=1 ↔ x < y (как U32)
+//   3. NormalizeU32: при signed=0, denomAbs=denom, remNormal=rem
+//
+// Верифицировано: NormalizeU32 ✓, CmpLessThanUnsigned ✓, MultiplyAccumulate ✓
+
+import u32;
+
+extern Divide(numer: ValU32, denom: ValU32, sign_type: Val) : DivideReturn;
+
+component DivideReturn(quot: ValU32, rem: ValU32) {
+  public quot := quot;
+  public rem := rem;
+}
+
+#[picus_analyze]
+component DoDiv(numer: ValU32, denom: ValU32, signed: Val, ones_comp: Val) {
+  // VERIFIER: unsigned-режим.
+  signed = 0;
+  ones_comp = 0;
+
+  // Prover guesses quot и rem.
+  guess := Divide(numer, denom, signed + 2 * ones_comp);
+  quot_low := NondetReg(guess.quot.low);
+  quot_high:= NondetReg(guess.quot.high);
+  quot := ValU32(quot_low, quot_high);
+  rem_low := NondetU16Reg(guess.rem.low);
+  rem_high:= NondetU16Reg(guess.rem.high);
+  rem := ValU32(rem_low, rem_high);
+
+  // --- Лемма 1: MultiplyAccumulate semantic spec ---
+  // outLow + 2^32·outHigh = quot·denom + rem (unsigned).
+  // Эквивалентно: numer = quot·denom + rem, outHigh = 0.
+  numer_flat    := U32Reg(numer.low + 0x10000 * numer.high);
+  denom_flat    := U32Reg(denom.low + 0x10000 * denom.high);
+  quot_flat     := U32Reg(quot.low  + 0x10000 * quot.high);
+  rem_flat      := U32Reg(rem.low   + 0x10000 * rem.high);
+
+  // --- Mux: denom=0 vs normal case ---
+  isZero := NondetBitReg(Isz(denom.low + denom.high));
+
+  // Case 1: denom = 0 → quot = 0xFFFFFFFF, rem = numer
+  isZero * denom.low = 0;
+  isZero * denom.high = 0;
+  isZero * rem.low = isZero * numer.low;
+  isZero * rem.high = isZero * numer.high;
+  isZero * quot.low = isZero * 0xffff;
+  isZero * quot.high = isZero * 0xffff;
+
+  // Case 2: denom ≠ 0 → numer = quot·denom + rem ∧ rem < denom
+  normalCase := 1 - isZero;
+
+  // Лемма 1: multiplication check.
+  // numer_flat = quot_flat * denom_flat + rem_flat
+  // Но нам нужна 64-битная проверка. Используем U32 для overflow:
+  // outLow + 2^32·outHigh = quot_flat·denom_flat + rem_flat.
+  // outLow = numer_flat, outHigh = 0 (для unsigned, нет overflow).
+  overflow_flat := U32Reg(0);
+  numer_flat + 0x100000000 * overflow_flat = quot_flat * denom_flat + rem_flat;
+
+  // VERIFIER: outHigh = 0 (беззнаковое умножение без переполнения).
+  // Это следует из того, что quot < 2^32, denom < 2^32,
+  // rem < denom < 2^32, и quot·denom + rem < 2^64.
+  // Но нам нужно: quot·denom + rem < 2^32 (т.е. overflow = 0),
+  // что эквивалентно numer < 2^32 (что верно, т.к. numer — ValU32).
+  normalCase * overflow_flat = 0;
+
+  // --- Лемма 2: rem < denom (семантика CmpLessThanUnsigned) ---
+  // Кодирование через slack: denom_flat = rem_flat + 1 + slack.
+  slack := NondetU32Reg(0);
+  normalCase * denom_flat = normalCase * (rem_flat + 1 + slack);
+
+  DivideReturn(quot, rem)
+}

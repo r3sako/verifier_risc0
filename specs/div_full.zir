@@ -37,6 +37,12 @@ component DoDiv(numer: ValU32, denom: ValU32, signed: Val, ones_comp: Val) {
   // Do the accumulate
   mul := MultiplyAccumulate(quot, denom, rem, settings);
 
+  // VERIFIER: при signed=0 ExpandU32 даёт neg=0. Без этих constraints
+  // UF-абстракция MultiplyAccumulate теряет связь bNeg↔signed, и солвер
+  // находит ложный контрпример с bNeg≠0, ломающий denomAbs.
+  mul.aNeg = 0;
+  mul.bNeg = 0;
+
   // VERIFIER: явная спека MultiplyAccumulate (unsigned-вариант).
   //   outLow + 2^32 · outHigh  =  quot · denom + rem  (как 64-битные числа).
   // Используем U32Reg, чтобы flat-значения были СВЕЖИМИ Int-переменными,

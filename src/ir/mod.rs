@@ -859,7 +859,9 @@ impl<'a> LowerCtx<'a> {
             }
             let arg = &args[i];
             if ptype == "ValU32" || ptype == "DenormedValU32" {
-                flat_args.push(arg.field("low").ok_or("missing .low")?.to_expr());
+                flat_args.push(arg.field("low")
+                    .ok_or(format!("missing .low on arg {} of abstract {} (got {:?})", i, name, arg))?
+                    .to_expr());
                 flat_args.push(arg.field("high").ok_or("missing .high")?.to_expr());
             } else if let Some(comp_def) = self.components.get(ptype.as_str()) {
                 for stmt in &comp_def.body {
@@ -879,7 +881,15 @@ impl<'a> LowerCtx<'a> {
                 Some((name.clone(), value.clone()))
             } else { None }
         }).collect();
-        if pub_bindings.is_empty() {
+        // Также проверяем return value (последний ExprStmt в body).
+        // Если компонент возвращает ValU32(...), это struct-выход.
+        let return_expr = comp.body.last().and_then(|s| {
+            if let Stmt::ExprStmt(e) = s { Some(e.clone()) } else { None }
+        });
+        let has_struct_return = matches!(&return_expr,
+            Some(Expr::Call { name: ctor, .. }) if ctor == "ValU32" || ctor == "DenormedValU32" || ctor == "DivideReturn"
+        );
+        if pub_bindings.is_empty() && !has_struct_return {
             return Err(format!("abstract {}: no public outputs", name));
         }
         // 3) Свежие internal-переменные на каждое поле.
@@ -911,6 +921,32 @@ impl<'a> LowerCtx<'a> {
                 output_pairs.push((fname.clone(), vname));
             }
         }
+        // 3b) Обработка return value (последний ExprStmt).
+        //     NormalizeU32 возвращает ValU32(low16, high16) — нужно создать
+        //     UF-переменные для low/high и включить их в struct_fields.
+        if has_struct_return {
+            if let Some(Expr::Call { name: ctor, .. }) = &return_expr {
+                if ctor == "ValU32" || ctor == "DenormedValU32" {
+                    let low_name  = self.fresh(prefix, &format!("{}_ret_low", name.to_lowercase()));
+                    let high_name = self.fresh(prefix, &format!("{}_ret_high", name.to_lowercase()));
+                    spec.internals.push(Var { name: low_name.clone(),  vtype: VarType::U16 });
+                    spec.internals.push(Var { name: high_name.clone(), vtype: VarType::U16 });
+                    struct_fields.insert("low".to_string(), Value::Expr(IrExpr::Var(low_name.clone())));
+                    struct_fields.insert("high".to_string(), Value::Expr(IrExpr::Var(high_name.clone())));
+                    output_pairs.push(("_ret.low".to_string(),  low_name));
+                    output_pairs.push(("_ret.high".to_string(), high_name));
+                } else if ctor == "DivideReturn" {
+                    let fields = ["quot_low", "quot_high", "rem_low", "rem_high"];
+                    for f in &fields {
+                        let vname = self.fresh(prefix, &format!("{}_ret_{}", name.to_lowercase(), f));
+                        spec.internals.push(Var { name: vname.clone(), vtype: VarType::U16 });
+                        struct_fields.insert(f.to_string(), Value::Expr(IrExpr::Var(vname.clone())));
+                        output_pairs.push((format!("_ret.{}", f), vname));
+                    }
+                }
+            }
+        }
+
         // 4) Записываем Call-constraint, который верификатор превратит в declare-fun + asserts.
         spec.constraints.push(IrConstraint::Call {
             component: name.to_string(),
